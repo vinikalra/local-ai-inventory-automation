@@ -1,0 +1,266 @@
+{
+  "name": "Local AI Inventory Management Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "waha-incoming",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "1a2b3c4d-0001-4000-8000-000000000001",
+      "name": "WAHA Incoming Message",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1120, 0],
+      "webhookId": "waha-incoming"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "cond-has-image",
+              "leftValue": "={{ $json.body.payload.hasMedia }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1a2b3c4d-0002-4000-8000-000000000002",
+      "name": "Has Photo Attachment?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-880, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://waha:3000/api/{{ $json.body.session }}/messages/{{ $json.body.payload.id }}/media",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": { "response": { "response": { "responseFormat": "file" } } }
+      },
+      "id": "1a2b3c4d-0003-4000-8000-000000000003",
+      "name": "Download Receipt Photo (WAHA)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-640, -100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Convert the downloaded binary image into base64 for the Ollama API\nconst binary = $input.first().binary.data;\nconst base64 = Buffer.from(await this.helpers.getBinaryDataBuffer(0, 'data')).toString('base64');\nreturn [{ json: { ...$input.first().json, image_base64: base64 } }];"
+      },
+      "id": "1a2b3c4d-0004-4000-8000-000000000004",
+      "name": "Encode Image Base64",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-400, -100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ollama:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: \"llama3.2-vision:11b\",\n  prompt: $('Encode Image Base64').item.json.promptText || $node[\"Load Extraction Prompt\"].json.prompt,\n  images: [ $json.image_base64 ],\n  format: \"json\",\n  stream: false\n}) }}",
+        "options": { "timeout": 120000 }
+      },
+      "id": "1a2b3c4d-0005-4000-8000-000000000005",
+      "name": "Ollama Vision Extraction",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-160, -100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ollama returns { response: \"<json string>\" } per our prompt contract.\n// Parse it and attach the original WhatsApp sender + chat id for later steps.\nconst ollama = $input.first().json;\nlet extracted;\ntry {\n  extracted = JSON.parse(ollama.response);\n} catch (e) {\n  extracted = { document_type: '', vendor: '', line_items: [], total: 0, confidence: 'low', notes: 'Failed to parse model output: ' + e.message };\n}\nconst trigger = $('WAHA Incoming Message').first().json.body;\nreturn [{\n  json: {\n    ...extracted,\n    sender_number: trigger.payload.from,\n    chat_id: trigger.payload.from,\n    session: trigger.session,\n    received_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "1a2b3c4d-0006-4000-8000-000000000006",
+      "name": "Parse Extraction JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [80, -100]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "mode": "id", "value": "={{ $env.GOOGLE_SHEETS_ID }}" },
+        "sheetName": { "mode": "name", "value": "Receipt Log" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $json.received_at }}",
+            "document_type": "={{ $json.document_type }}",
+            "vendor": "={{ $json.vendor }}",
+            "total": "={{ $json.total }}",
+            "confidence": "={{ $json.confidence }}",
+            "status": "pending_approval",
+            "raw_json": "={{ JSON.stringify($json.line_items) }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "1a2b3c4d-0007-4000-8000-000000000007",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [320, -100],
+      "credentials": { "googleSheetsOAuth2Api": { "id": "REPLACE_ME", "name": "Google Sheets account" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://waha:3000/api/sendText",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  session: $json.session,\n  chatId: $env.APPROVER_WHATSAPP_NUMBER + \"@c.us\",\n  text: `New ${$json.document_type} receipt from ${$json.vendor || 'unknown vendor'}\\nTotal: ${$json.total}\\nConfidence: ${$json.confidence}\\n\\nReply YES to approve or NO to reject.\\nApproval link: ${$execution.resumeUrl}`\n}) }}",
+        "options": {}
+      },
+      "id": "1a2b3c4d-0008-4000-8000-000000000008",
+      "name": "Send Approval Request (WAHA)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [560, -100]
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "webhookOptions": { "httpMethod": "POST", "responseMode": "onReceived" },
+        "limitWaitTime": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 24,
+        "resumeUnit": "hours"
+      },
+      "id": "1a2b3c4d-0009-4000-8000-000000000009",
+      "name": "Wait for Human Approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [800, -100],
+      "webhookId": "inventory-approval-resume"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "cond-approved",
+              "leftValue": "={{ $json.body.text }}",
+              "rightValue": "yes",
+              "operator": { "type": "string", "operation": "startsWith" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1a2b3c4d-0010-4000-8000-000000000010",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1040, -100]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "mode": "id", "value": "={{ $env.GOOGLE_SHEETS_ID }}" },
+        "sheetName": { "mode": "name", "value": "Live Inventory" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "sku_or_description": "={{ $('Parse Extraction JSON').item.json.line_items[0].sku_or_description }}",
+            "quantity_delta": "={{ $('Parse Extraction JSON').item.json.document_type === 'purchase' ? $('Parse Extraction JSON').item.json.line_items[0].quantity : -$('Parse Extraction JSON').item.json.line_items[0].quantity }}",
+            "last_updated": "={{ new Date().toISOString() }}"
+          }
+        },
+        "matchingColumns": ["sku_or_description"],
+        "options": {}
+      },
+      "id": "1a2b3c4d-0011-4000-8000-000000000011",
+      "name": "Update Live Inventory",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1280, -220],
+      "credentials": { "googleSheetsOAuth2Api": { "id": "REPLACE_ME", "name": "Google Sheets account" } },
+      "notes": "Demo maps only the first line item. Replace with a Split In Batches loop to handle multi-item receipts."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://waha:3000/api/sendText",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ session: $('Parse Extraction JSON').item.json.session, chatId: $('Parse Extraction JSON').item.json.chat_id + '@c.us', text: 'Approved. Inventory updated.' }) }}",
+        "options": {}
+      },
+      "id": "1a2b3c4d-0012-4000-8000-000000000012",
+      "name": "Confirm Approval (WAHA)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1520, -220]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "mode": "id", "value": "={{ $env.GOOGLE_SHEETS_ID }}" },
+        "sheetName": { "mode": "name", "value": "Receipt Log" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": { "status": "rejected" }
+        },
+        "matchingColumns": ["timestamp"],
+        "options": {}
+      },
+      "id": "1a2b3c4d-0013-4000-8000-000000000013",
+      "name": "Mark Rejected in Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1280, 20],
+      "credentials": { "googleSheetsOAuth2Api": { "id": "REPLACE_ME", "name": "Google Sheets account" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://waha:3000/api/sendText",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ session: $('Parse Extraction JSON').item.json.session, chatId: $('Parse Extraction JSON').item.json.chat_id + '@c.us', text: 'Rejected. No inventory change made.' }) }}",
+        "options": {}
+      },
+      "id": "1a2b3c4d-0014-4000-8000-000000000014",
+      "name": "Confirm Rejection (WAHA)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1520, 20]
+    }
+  ],
+  "connections": {
+    "WAHA Incoming Message": { "main": [[{ "node": "Has Photo Attachment?", "type": "main", "index": 0 }]] },
+    "Has Photo Attachment?": { "main": [[{ "node": "Download Receipt Photo (WAHA)", "type": "main", "index": 0 }], []] },
+    "Download Receipt Photo (WAHA)": { "main": [[{ "node": "Encode Image Base64", "type": "main", "index": 0 }]] },
+    "Encode Image Base64": { "main": [[{ "node": "Ollama Vision Extraction", "type": "main", "index": 0 }]] },
+    "Ollama Vision Extraction": { "main": [[{ "node": "Parse Extraction JSON", "type": "main", "index": 0 }]] },
+    "Parse Extraction JSON": { "main": [[{ "node": "Log to Google Sheets", "type": "main", "index": 0 }]] },
+    "Log to Google Sheets": { "main": [[{ "node": "Send Approval Request (WAHA)", "type": "main", "index": 0 }]] },
+    "Send Approval Request (WAHA)": { "main": [[{ "node": "Wait for Human Approval", "type": "main", "index": 0 }]] },
+    "Wait for Human Approval": { "main": [[{ "node": "Approved?", "type": "main", "index": 0 }]] },
+    "Approved?": {
+      "main": [
+        [{ "node": "Update Live Inventory", "type": "main", "index": 0 }],
+        [{ "node": "Mark Rejected in Log", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Live Inventory": { "main": [[{ "node": "Confirm Approval (WAHA)", "type": "main", "index": 0 }]] },
+    "Mark Rejected in Log": { "main": [[{ "node": "Confirm Rejection (WAHA)", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "local-inventory-automation",
+    "templateNote": "Import via n8n UI > Workflows > Import from File. Reconnect the Google Sheets credential (marked REPLACE_ME) and verify the WAHA webhook path/session name before activating."
+  }
+}

@@ -1,0 +1,7 @@
+.env
+*.log
+demo.gif
+n8n_data/
+ollama_data/
+waha_sessions/
+postgres_data/
